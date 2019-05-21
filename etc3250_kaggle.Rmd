@@ -13,22 +13,17 @@ rm(list=ls())
 library(tidyverse)
 library(caret)
 
-load("~/Downloads/ao_training.rda")
-load("~/Downloads/ao_test_unlabelled.rda")
+load("data/ao_training.rda")
+load("data/ao_test_unlabelled.rda")
 
 ```
-
-
-# TODO
-
-* Doesn't look like I have only included 1 variable for gender in the two shot model.CHECK and FIX.
 
 
 ## Process the data
 
 ```{r process-data}
-process_data <- function(x) {
-  x %>% 
+process_data <- function(x, data_name = "data") {
+  x <- x %>% 
     as_tibble() %>% 
     mutate(
       gender = case_when(
@@ -43,11 +38,12 @@ process_data <- function(x) {
     ungroup() %>% 
     select(-c(event, year, matchid)) %>% 
     mutate_if(is.factor, as.character) %>% 
-    select(pointid, matches("outcome"), everything()) %>% 
+    select(pointid, matches("outcome"), gender, everything()) %>% 
     # The following variables only have one value (because 1 serve rally)
     # so they are removed. Prevents error in caret::train.
     select(-c(starts_with("previous"), shotinrally, rally, 
-             server.is.impact.player, outside.baseline, hitpoint))
+              server.is.impact.player, outside.baseline, hitpoint)) %>% 
+    mutate(net.clearance = if_else(net.clearance == -0.5, 1.5, net.clearance))
   
   df_2 <- x %>% 
     group_by(pointid) %>% 
@@ -57,9 +53,11 @@ process_data <- function(x) {
     mutate(idx = 1:n()) %>% 
     ungroup() %>% 
     mutate_all(as.character) %>%  # prevents warning in gather
-    gather(var, val, -c(pointid, matches("outcome"), idx, serve, serverwon)) %>%
+    gather(var, val, -c(pointid, gender, matches("outcome"), idx, serve, serverwon)) %>%
     unite(var_idx, var, idx) %>% 
     spread(var_idx, val) %>% 
+    select(-previous.speed_2) %>%  # same as speed_1
+    rename(speed_0 = previous.speed_1) %>%  # rename to be consistent with speed_1, speed_2
     mutate_at(vars(
       starts_with("serve_"),
       starts_with("speed_"),
@@ -88,15 +86,31 @@ process_data <- function(x) {
       starts_with("server.is.impact.player_")
     ), as.logical) %>% 
     mutate_if(is.factor, as.character) %>% 
-    select(pointid, matches("outcome"), everything())
+    mutate(ball_dist_x_11 = opponent.distance.from.center_1 + distance.from.sideline_1,
+           ball_dist_x_12 = opponent.distance.from.center_1 + distance.from.sideline_2,
+           ball_dist_x_21 = opponent.distance.from.center_2 + distance.from.sideline_1,
+           ball_dist_x_22 = opponent.distance.from.center_2 + distance.from.sideline_2,
+           ball_dist_y_11 = opponent.depth_1 - depth_1,
+           ball_dist_y_12 = opponent.depth_1 - depth_2,
+           ball_dist_y_21 = opponent.depth_2 - depth_1,
+           ball_dist_y_22 = opponent.depth_2 - depth_2,
+           net_clearance_12 = net.clearance_1 + net.clearance_2,
+           opponent_distance_opp_impact = player.impact.distance.from.center_2 + opponent.distance.from.center_1,
+           speed_change_21 = speed_2 - speed_1,
+           speed_change_10 = speed_1 - speed_0,
+           speed_total_21 = speed_2 + speed_1,
+           speed_total_10 = speed_1 + speed_0,
+           speed_total_210 = speed_2 + speed_1 + speed_0) %>% 
+    select(pointid, matches("outcome"), gender, everything())
+  
   
   
   tibble(n_shots = c(1, 2),
-         data = list(df_1, df_2))
+         !!data_name := list(df_1, df_2))
 }
 
-train_df <- process_data(ao_tr)
-test_df <- process_data(ao_ts_unlabelled)
+model_df <- process_data(ao_tr, "train_data") %>% 
+  inner_join(process_data(ao_ts_unlabelled, "test_data"), by = "n_shots")
 ```
 
 
@@ -111,74 +125,163 @@ xgb_ctrl <- trainControl(
   savePredictions = "none"
 )
 
-# xgb_grid <- list(
-#   nrounds = 50,
-#   lambda = c(0, 50),
-#   alpha = 0,
-#   eta = 0.1
-# ) %>%
-#   cross_df() %>%
-#   as.data.frame()  # caret throws a weird error without
 
-# fit_boosted_model <- function(data, shot) {
-#   cat("Fitting model for", shot, "shot rallies...\n")
-# 
-#   data %>%
-#     select(-pointid) %>%
-#     na.omit() %>%
-#     train(outcome ~ .,
-#           data = .,
-#           method="xgbLinear",
-#           trControl = xgb_ctrl,
-#           nthread = 3)  #,
-#           # tuneGrid = xgb_grid)
-# }
-
-# xgb_grid <- list(
-#   nrounds = 50,
-#   max_depth = 6,
-#   eta = 0.1,
-#   gamma = 0,
-#   colsample_bytree = .8,
-#   min_child_weight = 1,
-#   subsample = 1
-# ) %>%
-#   cross_df() %>%
-#   as.data.frame()  # caret throws a weird error without
-# 
-# fit_boosted_model <- function(data, shot) {
-#   cat("Fitting model for", shot, "shot rallies...\n")
-# 
-#   data %>%
-#     select(-pointid) %>%
-#     na.omit() %>%
-#     train(outcome ~ .,
-#           data = .,
-#           method="xgbTree",
-#           trControl = xgb_ctrl)  #,
-#           # tuneGrid = xgb_grid)
-# }
+fit_xgb_linear_model <- function(data, shot) {
+  cat("Fitting xgbLinear model for", shot, "shot rallies...\n")
+  
+  data %>%
+    select(-pointid) %>%
+    na.omit() %>%
+    train(outcome ~ .,
+          data = .,
+          method="xgbLinear",
+          metric="Accuracy",
+          trControl = xgb_ctrl,
+          nthread = 11,
+          tuneGrid = list(nrounds = 100,
+                          lambda = c(0, exp(-c(10, 8, 6, 4, 2, 0))),
+                          alpha = 0,
+                          eta = 0.2) %>%
+            cross_df() %>%
+            as.data.frame())
+}
 
 
-fit_boosted_model <- function(data, shot) {
-  cat("Fitting model for", shot, "shot rallies...\n")
+fit_xgb_tree_model <- function(data, shot) {
+  cat("Fitting xgbTree model for", shot, "shot rallies...\n")
 
   data %>%
     select(-pointid) %>%
     na.omit() %>%
     train(outcome ~ .,
           data = .,
-          method="rf",
-          trControl = xgb_ctrl)  #,
-          # tuneGrid = xgb_grid)
+          method="xgbTree",
+          trControl = xgb_ctrl,
+          tuneGrid = list(nrounds = 150,
+                          max_depth = 3:6,
+                          eta = c(0.2, 0.3),
+                          gamma = c(0, 0.1, 0.2, 0.3),
+                          colsample_bytree = .8,
+                          min_child_weight = 1,
+                          subsample = c(.75, 1)) %>%
+            cross_df() %>%
+            as.data.frame())
 }
 
 
+model_df <- model_df %>% 
+  mutate(xgb_linear = map2(train_data, n_shots, fit_xgb_linear_model),
+         xgb_tree = map2(train_data, n_shots, fit_xgb_tree_model))
 
-train_df <- train_df %>% 
-  mutate(caret_train = map2(data, n_shots, fit_boosted_model),
-         final_model = map(caret_train, "finalModel"))
+save(model_df, file = "cache/model_df_1.Rdata")
 ```
+
+## Feature importance
+
+```{r}
+xgb.importance(model = model_df$xgb_tree[[2]]$finalModel) %>% 
+  as.data.frame() %>% 
+  gather(var, val, -Feature) %>% 
+  ggplot(aes(x = Feature, y = val, colour = var)) + 
+  geom_col(width= 0) + 
+  geom_point() +
+  facet_wrap(~var, ncol = 1) + 
+  theme(legend.position="none", 
+        axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+## Feature engineering ideas
+
+Remember to only look at those classes that are being misclassified. Might already be covering for these ideas with the fitted model.
+
+* net.clearance_2 and speed_2 could be a good predictor of unforced errors. Too fast and too high => goes out.
+* net.clearance_2 and distance
+* Check this for some ideas https://github.com/ml874/Predicting-How-Points-End-in-Tennis/blob/master/Gradient%20Boosting.ipynb
+* change in player distance (if somebody rushes the net they might make an error). Change between 2-1 and 1-0.
+
+```{r}
+# model_df$xgb_linear[[2]]$results %>% 
+#   select(nrounds:Accuracy) %>% 
+#   gather(var, val, -Accuracy) %>% 
+#   filter(var == "lambda") %>% 
+#   ggplot(aes(x = val, y = Accuracy)) + 
+#   geom_point() +
+#   scale_x_log10()# + 
+#   #geom_smooth()
+
+model_df$xgb_tree[[2]]$results %>% 
+  select(eta:Accuracy) %>% 
+  gather(var, val, -Accuracy) %>% 
+  ggplot(aes(x = val, y = Accuracy, group = val)) + 
+  geom_boxplot() + 
+  facet_wrap(~var, scales = "free_x")
+
+3942/(3942+22986)*.99997+22986/(3942+22986)*0.9168616
+```
+
+
+
+```{r}
+pred_class_df <- model_df$data[[2]] %>% 
+  mutate(pred = predict(model_df$xgb_tree[[2]], model_df$data[[2]]))
+
+table(pred_class_df$outcome, pred_class_df$pred)
+
+table(pred_class_df$outcome, pred_class_df$pred) %>% 
+  as.data.frame() %>% 
+  group_by(Var1) %>% 
+  mutate(accuracy = Freq/sum(Freq)) %>% 
+  filter(Var1 == Var2)
+```
+
+
+```{r}
+bad_df <- pred_class_df %>% 
+  filter(outcome %in% c("F", "U"),
+         outcome != pred)
+  
+# bad_df %>% 
+  # mutate() %>%
+  # select(gender, outcome, starts_with("ball_dist"), net_clearance_12, opponent_distance_opp_impact, speed_change_21) %>%
+  # select(gender, outcome, speed_change_21, speed_total_21) %>% 
+  # gather(var, val, -c(outcome, matches("gender"))) %>% 
+  # ggplot(aes(x = val, colour = outcome)) +
+  # geom_jitter()
+  # geom_density() +
+  # geom_rug() +
+  # facet_grid(gender~var)
+  # facet_wrap(~var)
+
+
+bad_df %>% 
+  filter(outcome %in% c("F", "U")) %>% 
+  ggplot(aes(x = player.impact.distance.travelled_2, y = speed_2, colour = outcome)) +
+  geom_point() +
+  facet_wrap(~gender)
+```
+
+
+
+
+```{r}
+library(GGally)
+
+pairs_df <- bad_df %>% 
+  select_if(~ is.numeric(.x) | is.logical(.x)) %>% 
+  mutate(outcome = bad_df$outcome) %>% 
+  select(outcome, everything())
+
+
+#pairs_df[sample(1:dim(pairs_df)[1], 200), sample(1:dim(pairs_df)[2], 10)] %>% 
+pairs_df %>% 
+  sample_frac(0.1) %>% 
+  select_at(c(1, 2:10)) %>% 
+  ggpairs(aes(colour = outcome), shape = "o", alpha = 0.5)
+```
+
+
 
 
 ## Predict results
