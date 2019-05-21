@@ -18,6 +18,7 @@ load("data/ao_test_unlabelled.rda")
 
 ```
 
+# Submission
 
 ## Process the data
 
@@ -176,6 +177,30 @@ model_df <- model_df %>%
 save(model_df, file = "cache/model_df_1.Rdata")
 ```
 
+
+## Predict results
+
+```{r}
+train_predict <- function(data, object) {
+  data %>% 
+    mutate(outcome = predict(object, data)) %>% 
+    select(pointid, outcome) %>% 
+    mutate_all(as.character)
+}
+
+prediction_df <- model_df %>% 
+  mutate(predictions = map2(test_data, xgb_tree, train_predict)) %>% 
+  select(predictions) %>% 
+  unnest() %>% 
+  arrange(pointid)
+
+write_csv(prediction_df, "cache/predictions_2.csv")
+```
+
+
+
+# Data exploration
+
 ## Feature importance
 
 ```{r}
@@ -218,7 +243,7 @@ model_df$xgb_tree[[2]]$results %>%
   geom_boxplot() + 
   facet_wrap(~var, scales = "free_x")
 
-3942/(3942+22986)*.99997+22986/(3942+22986)*0.9168616
+3942/(3942+22986)*.99997+22986/(3942+22986)*0.9167317
 ```
 
 
@@ -284,7 +309,3 @@ pairs_df %>%
 
 
 
-## Predict results
-
-1. Do predictions using test_df
-2. Join the original unlabelled data frame ao_test_unlabelled with the pointid and predicted outcome. Will need to select only these columns from the prediction data frame and unnest before joining. Check number and order of observations in ao_ts_unlabelled doesn't change.
