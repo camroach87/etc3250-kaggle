@@ -1,0 +1,187 @@
+---
+title: "ETC3250 kaggle comp"
+author: "Cameron Roach"
+date: "13/05/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls())
+
+library(tidyverse)
+library(caret)
+
+load("~/Downloads/ao_training.rda")
+load("~/Downloads/ao_test_unlabelled.rda")
+
+```
+
+
+# TODO
+
+* Doesn't look like I have only included 1 variable for gender in the two shot model.CHECK and FIX.
+
+
+## Process the data
+
+```{r process-data}
+process_data <- function(x) {
+  x %>% 
+    as_tibble() %>% 
+    mutate(
+      gender = case_when(
+        str_sub(matchid, 1, 2) == "MS" ~ "M",
+        str_sub(matchid, 1, 2) == "WS" ~ "F",
+        TRUE ~ str_sub(matchid, 1, 2))
+    )
+  
+  df_1 <- x %>% 
+    group_by(pointid) %>% 
+    filter(n() == 1) %>% 
+    ungroup() %>% 
+    select(-c(event, year, matchid)) %>% 
+    mutate_if(is.factor, as.character) %>% 
+    select(pointid, matches("outcome"), everything()) %>% 
+    # The following variables only have one value (because 1 serve rally)
+    # so they are removed. Prevents error in caret::train.
+    select(-c(starts_with("previous"), shotinrally, rally, 
+             server.is.impact.player, outside.baseline, hitpoint))
+  
+  df_2 <- x %>% 
+    group_by(pointid) %>% 
+    filter(n() == 2) %>% 
+    select(-c(event, year, matchid)) %>% 
+    arrange(pointid, shotinrally) %>% 
+    mutate(idx = 1:n()) %>% 
+    ungroup() %>% 
+    mutate_all(as.character) %>%  # prevents warning in gather
+    gather(var, val, -c(pointid, matches("outcome"), idx, serve, serverwon)) %>%
+    unite(var_idx, var, idx) %>% 
+    spread(var_idx, val) %>% 
+    mutate_at(vars(
+      starts_with("serve_"),
+      starts_with("speed_"),
+      starts_with("net.clearance_"),
+      starts_with("time.to.net_"),
+      starts_with("distance.from.sideline_"),
+      starts_with("depth_"),
+      starts_with("player.impact.distance.travelled_"),
+      starts_with("player.impact.depth_"),
+      starts_with("player.impact.distance.from.center_"),
+      starts_with("previous.speed_"),
+      starts_with("previous.net.clearance_"),
+      starts_with("previous.distance.from.sideline_"),
+      starts_with("previous.depth_"),
+      starts_with("opponent.distance.travelled_"),
+      starts_with("opponent.depth_"),
+      starts_with("opponent.distance.from.center_"),
+      starts_with("previous.time.to.net_"),
+      starts_with("shotinrally_"),
+      starts_with("rally_")
+    ), as.numeric) %>% 
+    mutate_at(vars(
+      starts_with("outside.sideline_"),
+      starts_with("outside.baseline_"),
+      starts_with("same.side_"),
+      starts_with("server.is.impact.player_")
+    ), as.logical) %>% 
+    mutate_if(is.factor, as.character) %>% 
+    select(pointid, matches("outcome"), everything())
+  
+  
+  tibble(n_shots = c(1, 2),
+         data = list(df_1, df_2))
+}
+
+train_df <- process_data(ao_tr)
+test_df <- process_data(ao_ts_unlabelled)
+```
+
+
+```{r fit-models}
+xgb_ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  allowParallel = FALSE,
+  returnData = FALSE,
+  trim = TRUE,
+  returnResamp = "none",
+  savePredictions = "none"
+)
+
+# xgb_grid <- list(
+#   nrounds = 50,
+#   lambda = c(0, 50),
+#   alpha = 0,
+#   eta = 0.1
+# ) %>%
+#   cross_df() %>%
+#   as.data.frame()  # caret throws a weird error without
+
+# fit_boosted_model <- function(data, shot) {
+#   cat("Fitting model for", shot, "shot rallies...\n")
+# 
+#   data %>%
+#     select(-pointid) %>%
+#     na.omit() %>%
+#     train(outcome ~ .,
+#           data = .,
+#           method="xgbLinear",
+#           trControl = xgb_ctrl,
+#           nthread = 3)  #,
+#           # tuneGrid = xgb_grid)
+# }
+
+# xgb_grid <- list(
+#   nrounds = 50,
+#   max_depth = 6,
+#   eta = 0.1,
+#   gamma = 0,
+#   colsample_bytree = .8,
+#   min_child_weight = 1,
+#   subsample = 1
+# ) %>%
+#   cross_df() %>%
+#   as.data.frame()  # caret throws a weird error without
+# 
+# fit_boosted_model <- function(data, shot) {
+#   cat("Fitting model for", shot, "shot rallies...\n")
+# 
+#   data %>%
+#     select(-pointid) %>%
+#     na.omit() %>%
+#     train(outcome ~ .,
+#           data = .,
+#           method="xgbTree",
+#           trControl = xgb_ctrl)  #,
+#           # tuneGrid = xgb_grid)
+# }
+
+
+fit_boosted_model <- function(data, shot) {
+  cat("Fitting model for", shot, "shot rallies...\n")
+
+  data %>%
+    select(-pointid) %>%
+    na.omit() %>%
+    train(outcome ~ .,
+          data = .,
+          method="rf",
+          trControl = xgb_ctrl)  #,
+          # tuneGrid = xgb_grid)
+}
+
+
+
+train_df <- train_df %>% 
+  mutate(caret_train = map2(data, n_shots, fit_boosted_model),
+         final_model = map(caret_train, "finalModel"))
+```
+
+
+## Predict results
+
+1. Do predictions using test_df
+2. Join the original unlabelled data frame ao_test_unlabelled with the pointid and predicted outcome. Will need to select only these columns from the prediction data frame and unnest before joining. Check number and order of observations in ao_ts_unlabelled doesn't change.
